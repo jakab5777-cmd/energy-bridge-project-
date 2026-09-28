@@ -1,0 +1,192 @@
+const express = require('express');
+const router = express.Router();
+const d = require('../db');
+const requireAdmin = require('./../require-admin.js');
+const pool = d.pool || d;
+
+// The registry: the ONLY place a resource maps to a table. The client sends a
+// resource KEY and never a table name -- a route that accepted a table name
+// from the browser would be an arbitrary-read endpoint in an archive's coat.
+// Every name below was read off the live DB and off EB_ACTIONS in core.js:
+// this DB carries old AND _v2 copies of several tables, and these name the one
+// the frontend actually writes to.
+const ARCHIVE = {
+  /* Added by archive-expand.js — these deletes used to be permanent. */
+  user: { table: "ip_manager_users", idCol: "id", label: r => String(r.username ?? r.id) },
+  role: { table: "user_roles", idCol: "role_id", label: r => String(r.name ?? r.role_id) },
+  credential: { table: "credentials", idCol: "id", label: r => String(r.ip_address ?? r.id) },
+  stock: { table: "stock", idCol: "id", label: r => String(r.sn ?? r.id) },
+  brand: { table: "brands", idCol: "id", label: r => String(r.brand ?? r.id) },
+  supplier: { table: "suppliers", idCol: "id", label: r => String(r.supplier ?? r.id) },
+  type: { table: "types", idCol: "id", label: r => String(r.type ?? r.id) },
+  ticket: { table: "tickets", idCol: "reference_id", label: r => String(r.reference_id ?? r.reference_id) },
+  ticket_comment: { table: "ticket_comments", idCol: "id", label: r => String(r.comment ?? r.id) },
+  support_log: { table: "support_log", idCol: "id", label: r => String(r.client_id ?? r.id) },
+  visit_report: { table: "visit_reports", idCol: "id", label: r => String(r.client_id ?? r.id) },
+
+  subnet_real: {
+    table: 'real_ip_subnets', idCol: 'id', keepId: true,
+    label: r => r.real_ip_block,
+    children: [{ table: 'real_ips', where: 'subnet = $1', arg: r => r.real_ip_block }]
+  },
+  subnet_fake: {
+    table: 'internal_ip_subnets', idCol: 'id', keepId: true,
+    label: r => r.internal_ip_block,
+    children: [{ table: 'internal_ips', where: 'subnet = $1', arg: r => r.internal_ip_block }]
+  },
+  wan:    { table: 'wan_solutions_v2', idCol: 'id',
+            label: r => (r.client_id || '-') + ' / ' + (r.branch_code || '-') },
+  tunnel: { table: 'ip_tunnels_v2',    idCol: 'id',
+            label: r => (r.client_id || '-') + ' / ' + (r.local_ip || r.overlay_local_ip || '-') },
+  // vpn_entries, NOT vpns: /vpn is hand-written and writes vpn_entries.
+  // vpn_password_encrypted is archived as stored -- still encrypted.
+  vpn:    { table: 'vpn_entries',      idCol: 'id',
+            label: r => (r.client_id || '-') + ' / ' + (r.vpn_type || '-') },
+  vlan:   { table: 'vlans_v2',         idCol: 'id',
+            label: r => 'VLAN ' + r.id + ' / ' + (r.client_id || '-') },
+  dsp:    { table: 'dsp_providers_v2', idCol: 'id',
+            label: r => r.code_name || r.dsp_name || String(r.id) },
+  // No client_branches table in this schema: the clients row is the whole record.
+  client: { table: 'clients',          idCol: 'id', keepId: true,
+            label: r => (r.id + ' ' + (r.client_name || '')).trim() },
+  device: { table: 'devices',          idCol: 'id', label: r => r.hostname || String(r.id) },
+  lte:    { table: 'lte_devices',      idCol: 'id', label: r => r.imei || r.client_id || String(r.id) }
+};
+
+// Every identifier passes through this even though they all come from the
+// registry. A constant that becomes a variable one day is how an injection
+// arrives in an edit that looked harmless.
+const ident = (s) => {
+  if (!/^[a-z_][a-z0-9_]*$/.test(String(s))) throw new Error('bad identifier: ' + s);
+  return s;
+};
+
+// A wrong table name should announce itself at BOOT, not while someone is
+// deleting something. Logs once; changes nothing.
+(async () => {
+  try {
+    const { rows } = await pool.query(
+      "SELECT table_name FROM information_schema.tables WHERE table_schema='public'");
+    const have = new Set(rows.map(r => r.table_name));
+    const missing = [];
+    for (const key of Object.keys(ARCHIVE)) {
+      const spec = ARCHIVE[key];
+      if (!have.has(spec.table)) missing.push(key + ' -> ' + spec.table);
+      (spec.children || []).forEach(c => {
+        if (!have.has(c.table)) missing.push(key + ' child -> ' + c.table);
+      });
+    }
+    if (!have.has('eb_archive'))
+      console.error('[archive] eb_archive does not exist - run the migration first.');
+    if (missing.length)
+      console.error('[archive] registry names tables that do not exist: ' + missing.join(', '));
+    else
+      console.log('[archive] registry checked: ' + Object.keys(ARCHIVE).length + ' resources, all tables present');
+  } catch (e) {
+    console.error('[archive] could not verify the registry: ' + e.message);
+  }
+})();
+
+// SNAPSHOT - called BEFORE the delete
+router.post('/', async (req, res) => {
+  try {
+    const body = req.body || {};
+    const resource = body.resource;
+    const id = body.id;
+    const spec = ARCHIVE[resource];
+    if (!spec) return res.status(400).json({ ok: false, error: 'unknown resource: ' + resource });
+    if (id === undefined || id === null || id === '')
+      return res.status(400).json({ ok: false, error: 'id is required' });
+
+    // ::text so a bigint id and a text id both compare cleanly.
+    const found = await pool.query(
+      'SELECT * FROM ' + ident(spec.table) + ' WHERE ' + ident(spec.idCol) + '::text = $1', [String(id)]);
+    const row = found.rows[0];
+    if (!row) return res.status(404).json({ ok: false, error: 'no such row to archive' });
+
+    const children = {};
+    let count = 1;
+    for (const c of (spec.children || [])) {
+      const kid = await pool.query(
+        'SELECT * FROM ' + ident(c.table) + ' WHERE ' + c.where, [c.arg(row)]);
+      children[c.table] = kid.rows;
+      count += kid.rows.length;
+    }
+
+    const ins = await pool.query(
+      'INSERT INTO eb_archive (resource, resource_id, label, payload, children, row_count, deleted_by)' +
+      ' VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING id, deleted_at',
+      [resource, String(id), String(spec.label(row) || id), row,
+       JSON.stringify(children), count, (req.user && req.user.username) || null]);
+
+    res.json({ ok: true, id: ins.rows[0].id, archived: count, deleted_at: ins.rows[0].deleted_at });
+  } catch (err) {
+    console.error('[archive] snapshot failed:', err);
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// WHAT CAN BE RESTORED
+router.get('/', async (req, res) => {
+  try {
+    const args = [];
+    let where = '';
+    if (req.query.resource) { args.push(req.query.resource); where = 'WHERE resource = $1'; }
+    args.push(Math.min(Number(req.query.limit) || 200, 500));
+    const { rows } = await pool.query(
+      'SELECT id, resource, resource_id, label, row_count, deleted_by, deleted_at, restored_at' +
+      ' FROM eb_archive ' + where + ' ORDER BY deleted_at DESC LIMIT $' + args.length, args);
+    res.json({ ok: true, data: rows });
+  } catch (err) {
+    console.error('[archive] list failed:', err);
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// RESTORE
+router.post('/:id/restore', requireAdmin, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const got = await pool.query('SELECT * FROM eb_archive WHERE id = $1', [req.params.id]);
+    const a = got.rows[0];
+    if (!a) { client.release(); return res.status(404).json({ ok: false, error: 'no such archive entry' }); }
+    const spec = ARCHIVE[a.resource];
+    if (!spec) { client.release(); return res.status(400).json({ ok: false, error: 'this build no longer knows ' + a.resource }); }
+
+    const insert = async (table, row, keepId) => {
+      const r = Object.assign({}, row);
+      // Fresh id from the sequence, EXCEPT where the id IS the identity
+      // (subnet register, client code) -- reusing it is the point of restoring.
+      if (!keepId) delete r.id;
+      const cols = Object.keys(r);
+      if (!cols.length) return;
+      const ph = cols.map((_, i) => '$' + (i + 1)).join(',');
+      // ON CONFLICT DO NOTHING, never DO UPDATE: if the address or tag was
+      // given to someone else while this was gone, THAT owner is the truth.
+      await client.query(
+        'INSERT INTO ' + ident(table) + ' (' + cols.map(ident).join(',') + ')' +
+        ' VALUES (' + ph + ') ON CONFLICT DO NOTHING', cols.map(c => r[c]));
+    };
+
+    await client.query('BEGIN');
+    // Parent first: a child whose parent is missing is the orphan state that
+    // made subnets undeletable in the first place.
+    await insert(spec.table, a.payload, spec.keepId === true);
+    for (const table of Object.keys(a.children || {}))
+      for (const row of a.children[table]) await insert(table, row, false);
+    await client.query('UPDATE eb_archive SET restored_at = now() WHERE id = $1', [a.id]);
+    await client.query('COMMIT');
+
+    // The archive row is KEPT and only stamped: a restore that erases the
+    // record of the deletion leaves nothing to explain the gap.
+    res.json({ ok: true, resource: a.resource, label: a.label, restored: a.row_count });
+  } catch (err) {
+    try { await client.query('ROLLBACK'); } catch (e) {}
+    console.error('[archive] restore failed:', err);
+    res.status(500).json({ ok: false, error: err.message });
+  } finally {
+    client.release();
+  }
+});
+
+module.exports = router;

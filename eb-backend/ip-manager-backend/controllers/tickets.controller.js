@@ -1,0 +1,201 @@
+// controllers/tickets.controller.js
+// Matches the existing controller style (permissions.controller.js / roles.controller.js):
+//   - `const pool = require('../src/db')`
+//   - try/catch on every handler
+//   - envelope { ok:true, data } / { ok:false, error }
+const pool = require('../src/db');
+
+const ALLOWED_STATUSES = ['Open', 'Assigned', 'In Progress', 'Pending', 'Resolved', 'Closed', 'Cancelled'];
+
+// `case` is a RESERVED SQL keyword in Postgres — it MUST be quoted as "case"
+// in every statement, or the query fails with 42601 (syntax error). This map
+// turns a request-body field name into its safe SQL column identifier.
+const COLUMN_SQL = {
+  client_id: 'client_id',
+  department: 'department',
+  phone_number: 'phone_number',
+  sales_agent: 'sales_agent',
+  connection_name: 'connection_name',
+  status: 'status',
+  case: '"case"',        // reserved keyword → always quoted
+  solution: 'solution',
+  assigned_user_id: 'assigned_user_id',
+  assigned_role_id: 'assigned_role_id',
+};
+
+// Ticketing assigns to staff users in `registered_users`
+// (integer `user_id`, boolean `is_active`). Confirmed against the live schema.
+
+async function createTicket(req, res) {
+  try {
+    const { client_id, department, phone_number, sales_agent, connection_name,
+            case: caseText, solution, assigned_user_id, assigned_role_id, status } = req.body;
+    const missing = ['department', 'phone_number', 'sales_agent', 'connection_name'].filter(f => !req.body[f]);
+    if (missing.length) {
+      return res.status(422).json({ ok: false, error: 'Validation failed', fields: { required: missing } });
+    }
+    // If a user/role is assigned at creation, reflect that in the status.
+    let st = (status && ALLOWED_STATUSES.includes(status)) ? status
+           : ((assigned_user_id || assigned_role_id) ? 'Assigned' : 'Open');
+    const { rows } = await pool.query(
+      `INSERT INTO tickets (reference_id, client_id, department, phone_number, sales_agent, connection_name, status, "case", solution, assigned_user_id, assigned_role_id)
+       VALUES ('T' || lpad(nextval('ticket_ref_seq')::text, 5, '0'), $1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+       RETURNING *`,
+      [client_id ?? null, department, phone_number, sales_agent, connection_name, st,
+       caseText ?? null, solution ?? null, assigned_user_id || null, assigned_role_id || null]
+    );
+    return res.status(201).json({ ok: true, data: rows[0] });
+  } catch (err) {
+    console.error('createTicket error:', err);
+    return res.status(500).json({ ok: false, error: 'Internal server error' });
+  }
+}
+
+async function getTickets(req, res) {
+  try {
+    // company_name / assigned_user_name / assigned_role_name are joined in (not
+    // stored on the ticket). They are null when no client / no assignee is set.
+    const { rows } = await pool.query(
+      `SELECT t.*, c.client_name AS company_name,
+              ru.username AS assigned_user_name,
+              ur.name     AS assigned_role_name
+         FROM tickets t
+         LEFT JOIN clients c          ON c.id = t.client_id
+         LEFT JOIN registered_users ru ON ru.user_id = t.assigned_user_id
+         LEFT JOIN user_roles ur       ON ur.role_id = t.assigned_role_id
+        ORDER BY t.created_at DESC`
+    );
+    return res.json({ ok: true, data: rows });
+  } catch (err) {
+    console.error('getTickets error:', err);
+    return res.status(500).json({ ok: false, error: 'Internal server error' });
+  }
+}
+
+async function getTicketByRef(req, res) {
+  try {
+    const { rows } = await pool.query(
+      `SELECT t.*, c.client_name AS company_name,
+              ru.username AS assigned_user_name,
+              ur.name     AS assigned_role_name
+         FROM tickets t
+         LEFT JOIN clients c          ON c.id = t.client_id
+         LEFT JOIN registered_users ru ON ru.user_id = t.assigned_user_id
+         LEFT JOIN user_roles ur       ON ur.role_id = t.assigned_role_id
+        WHERE t.reference_id = $1`,
+      [req.params.reference_id]
+    );
+    if (!rows.length) return res.status(404).json({ ok: false, error: 'Ticket not found.' });
+    return res.json({ ok: true, data: rows[0] });
+  } catch (err) {
+    console.error('getTicketByRef error:', err);
+    return res.status(500).json({ ok: false, error: 'Internal server error' });
+  }
+}
+
+async function updateTicket(req, res) {
+  try {
+    const fields = ['client_id', 'department', 'phone_number', 'sales_agent', 'connection_name', 'status', 'case', 'solution', 'assigned_user_id', 'assigned_role_id'];
+    const updates = fields.filter(f => req.body[f] !== undefined);
+    if (!updates.length) return res.status(422).json({ ok: false, error: 'No updatable fields provided' });
+    if (req.body.status !== undefined && !ALLOWED_STATUSES.includes(req.body.status)) {
+      return res.status(422).json({ ok: false, error: 'Invalid status' });
+    }
+    // Use COLUMN_SQL so reserved keywords (e.g. "case") are quoted correctly.
+    const setClause = updates.map((f, i) => `${COLUMN_SQL[f]} = $${i + 1}`).join(', ');
+    const values = updates.map(f => req.body[f]);
+    const { rows } = await pool.query(
+      `UPDATE tickets SET ${setClause}, updated_at = now() WHERE reference_id = $${updates.length + 1} RETURNING *`,
+      [...values, req.params.reference_id]
+    );
+    if (!rows.length) return res.status(404).json({ ok: false, error: 'Ticket not found.' });
+    return res.json({ ok: true, data: rows[0] });
+  } catch (err) {
+    console.error('updateTicket error:', err);
+    return res.status(500).json({ ok: false, error: 'Internal server error' });
+  }
+}
+
+async function updateTicketStatus(req, res) {
+  try {
+    const { status } = req.body;
+    if (!ALLOWED_STATUSES.includes(status)) {
+      return res.status(422).json({ ok: false, error: 'Invalid status', allowed: ALLOWED_STATUSES });
+    }
+    const { rows } = await pool.query(
+      `UPDATE tickets SET status = $1, updated_at = now() WHERE reference_id = $2 RETURNING *`,
+      [status, req.params.reference_id]
+    );
+    if (!rows.length) return res.status(404).json({ ok: false, error: 'Ticket not found.' });
+    return res.json({ ok: true, data: rows[0] });
+  } catch (err) {
+    console.error('updateTicketStatus error:', err);
+    return res.status(500).json({ ok: false, error: 'Internal server error' });
+  }
+}
+
+async function deleteTicket(req, res) {
+  try {
+    const { rows } = await pool.query(
+      `DELETE FROM tickets WHERE reference_id = $1 RETURNING reference_id`,
+      [req.params.reference_id]
+    );
+    if (!rows.length) return res.status(404).json({ ok: false, error: 'Ticket not found.' });
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error('deleteTicket error:', err);
+    return res.status(500).json({ ok: false, error: 'Internal server error' });
+  }
+}
+
+async function assignUser(req, res) {
+  try {
+    const { user_id } = req.body;
+    if (!user_id) return res.status(422).json({ ok: false, error: 'user_id is required' });
+
+    const ticket = await pool.query(`SELECT status FROM tickets WHERE reference_id = $1`, [req.params.reference_id]);
+    if (!ticket.rows.length) return res.status(404).json({ ok: false, error: 'Ticket not found.' });
+    if (ticket.rows[0].status === 'Closed') return res.status(409).json({ ok: false, error: 'Ticket is closed.' });
+
+    const user = await pool.query(`SELECT 1 FROM registered_users WHERE user_id = $1 AND is_active = true LIMIT 1`, [user_id]);
+    if (!user.rows.length) return res.status(404).json({ ok: false, error: 'User not found or inactive.' });
+
+    const { rows } = await pool.query(
+      `UPDATE tickets SET assigned_user_id = $1, status = 'Assigned', updated_at = now()
+       WHERE reference_id = $2 RETURNING *`,
+      [user_id, req.params.reference_id]
+    );
+    return res.json({ ok: true, data: rows[0] });
+  } catch (err) {
+    console.error('assignUser error:', err);
+    return res.status(500).json({ ok: false, error: 'Internal server error' });
+  }
+}
+
+async function assignRole(req, res) {
+  try {
+    const { role_id } = req.body;
+    if (!role_id) return res.status(422).json({ ok: false, error: 'role_id is required' });
+
+    const ticket = await pool.query(`SELECT status FROM tickets WHERE reference_id = $1`, [req.params.reference_id]);
+    if (!ticket.rows.length) return res.status(404).json({ ok: false, error: 'Ticket not found.' });
+
+    const role = await pool.query(`SELECT 1 FROM user_roles WHERE role_id = $1 LIMIT 1`, [role_id]);
+    if (!role.rows.length) return res.status(404).json({ ok: false, error: 'Role not found.' });
+
+    const { rows } = await pool.query(
+      `UPDATE tickets SET assigned_role_id = $1, status = 'Assigned', updated_at = now()
+       WHERE reference_id = $2 RETURNING *`,
+      [role_id, req.params.reference_id]
+    );
+    return res.json({ ok: true, data: rows[0] });
+  } catch (err) {
+    console.error('assignRole error:', err);
+    return res.status(500).json({ ok: false, error: 'Internal server error' });
+  }
+}
+
+module.exports = {
+  createTicket, getTickets, getTicketByRef, updateTicket,
+  updateTicketStatus, deleteTicket, assignUser, assignRole,
+};

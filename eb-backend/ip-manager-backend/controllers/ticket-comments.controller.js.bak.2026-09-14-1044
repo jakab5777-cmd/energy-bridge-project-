@@ -1,0 +1,89 @@
+// controllers/ticket-comments.controller.js
+// Same style as tickets.controller.js: pool from ../src/db, try/catch on every
+// handler, { ok:true, data } / { ok:false, error } envelope.
+const pool = require('../src/db');
+
+// Resolve the comment author from the authenticated token — NEVER from the body.
+// requireAuth attaches the decoded token to req.auth. Adjust the field here if
+// your token uses a different identity claim (see FOR_THE_DEV.md).
+function authorFrom(req) {
+  const u = req.auth || {};
+  return u.username || u.name || u.email || (u.userId != null ? String(u.userId) : null);
+}
+
+// GET /  — full log, or just one ticket's log via ?ticket_id=T00010
+async function getComments(req, res) {
+  try {
+    const { ticket_id } = req.query;
+    const { rows } = ticket_id
+      ? await pool.query(
+          `SELECT * FROM ticket_comments WHERE ticket_id = $1 ORDER BY created_at ASC`,
+          [ticket_id]
+        )
+      : await pool.query(`SELECT * FROM ticket_comments ORDER BY created_at ASC`);
+    return res.json({ ok: true, data: rows });
+  } catch (err) {
+    console.error('getComments error:', err);
+    return res.status(500).json({ ok: false, error: 'Internal server error' });
+  }
+}
+
+// POST /  — { ticket_id, comment }. author + created_at are server-set.
+async function createComment(req, res) {
+  try {
+    const { ticket_id, comment } = req.body;
+    const missing = ['ticket_id', 'comment'].filter(f => !req.body[f] || String(req.body[f]).trim() === '');
+    if (missing.length) {
+      return res.status(422).json({ ok: false, error: 'Validation failed', fields: { required: missing } });
+    }
+    // ticket_id must reference an existing ticket (tickets PK is reference_id).
+    const t = await pool.query(`SELECT 1 FROM tickets WHERE reference_id = $1 LIMIT 1`, [ticket_id]);
+    if (!t.rows.length) return res.status(404).json({ ok: false, error: 'Ticket not found.' });
+
+    const { rows } = await pool.query(
+      `INSERT INTO ticket_comments (ticket_id, author, comment)
+       VALUES ($1, $2, $3) RETURNING *`,
+      [ticket_id, authorFrom(req), comment]
+    );
+    return res.status(201).json({ ok: true, data: rows[0] });
+  } catch (err) {
+    console.error('createComment error:', err);
+    return res.status(500).json({ ok: false, error: 'Internal server error' });
+  }
+}
+
+// PUT /:id  — only `comment` is editable; ticket_id/author/created_at are fixed.
+async function updateComment(req, res) {
+  try {
+    const { comment } = req.body;
+    if (!comment || String(comment).trim() === '') {
+      return res.status(422).json({ ok: false, error: 'Validation failed', fields: { required: ['comment'] } });
+    }
+    const { rows } = await pool.query(
+      `UPDATE ticket_comments SET comment = $1 WHERE id = $2 RETURNING *`,
+      [comment, req.params.id]
+    );
+    if (!rows.length) return res.status(404).json({ ok: false, error: 'Comment not found.' });
+    return res.json({ ok: true, data: rows[0] });
+  } catch (err) {
+    console.error('updateComment error:', err);
+    return res.status(500).json({ ok: false, error: 'Internal server error' });
+  }
+}
+
+// DELETE /:id
+async function deleteComment(req, res) {
+  try {
+    const { rows } = await pool.query(
+      `DELETE FROM ticket_comments WHERE id = $1 RETURNING id`,
+      [req.params.id]
+    );
+    if (!rows.length) return res.status(404).json({ ok: false, error: 'Comment not found.' });
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error('deleteComment error:', err);
+    return res.status(500).json({ ok: false, error: 'Internal server error' });
+  }
+}
+
+module.exports = { getComments, createComment, updateComment, deleteComment };

@@ -1,0 +1,33 @@
+const pool = require('../src/db');
+
+async function getPermissions(req, res) {
+    try {
+        const result = await pool.query(
+            `SELECT permission_id, module, permission_name, description FROM permissions ORDER BY module, permission_name`
+        );
+        return res.json(result.rows);
+    } catch (err) {
+        console.error('getPermissions error:', err);
+        return res.status(500).json({ error: 'Internal server error' });
+    }
+}
+
+async function getRolePermissions(req, res) {
+    try {
+        const { role } = req.params;
+        const result = await pool.query(
+            `SELECT p.permission_id, p.module, p.permission_name, p.description
+             FROM role_permissions rp
+             JOIN permissions p ON p.permission_id = rp.permission_id
+             WHERE rp.role = $1
+             ORDER BY p.module, p.permission_name`,
+            [role]
+        );
+        return res.json(result.rows);
+    } catch (err) {
+        console.error('getRolePermissions error:', err);
+        return res.status(500).json({ error: 'Internal server error' });
+    }
+}
+
+module.exports = { getPermissions, getRolePermissions };

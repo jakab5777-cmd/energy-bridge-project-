@@ -1,0 +1,64 @@
+const express = require('express');
+const pool = require('../db');
+const { requirePermission } = require('../middleware/auth');
+const router = express.Router();
+
+// GET /api/ip-manager/real-ips?subnet=5.100.240
+router.get('/', requirePermission('seeRealIP'), async (req, res) => {
+  const { subnet } = req.query;
+  const query = subnet
+    ? { text: 'SELECT * FROM real_ips WHERE subnet = $1 ORDER BY real_ip', values: [subnet] }
+    : { text: 'SELECT * FROM real_ips ORDER BY subnet, real_ip' };
+  const { rows } = await pool.query(query);
+  res.json({ ok: true, data: rows });
+});
+
+// PATCH /api/ip-manager/real-ips/batch
+// Replaces saveRows(payload) — payload: { subnet, rows: [{real_ip, client_id, client_name, fake_ip, vlan_id, dsp, block_id}] }
+router.patch('/batch', requirePermission('assignReal'), async (req, res) => {
+  const { subnet, rows } = req.body;
+  if (!subnet || !Array.isArray(rows)) {
+    return res.status(400).json({ ok: false, error: 'subnet and rows[] required' });
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    for (const row of rows) {
+      await client.query(
+        `INSERT INTO real_ips (subnet, real_ip, client_id, client_name, fake_ip, vlan_id, dsp, block_id, updated_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8, NOW())
+         ON CONFLICT (real_ip) DO UPDATE SET
+           client_id = EXCLUDED.client_id, client_name = EXCLUDED.client_name,
+           fake_ip = EXCLUDED.fake_ip, vlan_id = EXCLUDED.vlan_id,
+           dsp = EXCLUDED.dsp, block_id = EXCLUDED.block_id, updated_at = NOW()`,
+        [subnet, row.real_ip, row.client_id || null, row.client_name || null,
+         row.fake_ip || null, row.vlan_id || null, row.dsp || null, row.block_id || null]
+      );
+    }
+    await client.query('COMMIT');
+    res.json({ ok: true, updated: rows.length });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    res.status(500).json({ ok: false, error: err.message });
+  } finally {
+    client.release();
+  }
+});
+
+// PATCH /api/ip-manager/real-ips/clear
+// Replaces clearRows(payload) — clears assignment fields but keeps the IP row
+router.patch('/clear', requirePermission('editReal'), async (req, res) => {
+  const { real_ips } = req.body; // array of IP strings to clear
+  if (!Array.isArray(real_ips)) return res.status(400).json({ ok: false, error: 'real_ips[] required' });
+
+  await pool.query(
+    `UPDATE real_ips SET client_id = NULL, client_name = NULL, fake_ip = NULL,
+     vlan_id = NULL, dsp = NULL, block_id = NULL, updated_at = NOW()
+     WHERE real_ip = ANY($1)`,
+    [real_ips]
+  );
+  res.json({ ok: true, cleared: real_ips.length });
+});
+
+module.exports = router;
